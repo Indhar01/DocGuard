@@ -10,6 +10,10 @@
 
 ---
 
+URL to access portal: https://application-test1.1yoossgcut95.ca-tor.codeengine.appdomain.cloud/
+
+---
+
 ### Table of Contents
 
 1.  [Project Abstract](#1-project-abstract)

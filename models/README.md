@@ -1,0 +1,2 @@
+VLM-based document classification, OCR extraction, and visual analysis : meta-llama/llama-3-2-90b-vision-instruct
+LLM-based expert reasoning over all collected evidence : meta-llama/llama-3-3-70b-instruct

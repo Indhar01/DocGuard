@@ -8,11 +8,7 @@
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.30+-ff4b4b)](https://streamlit.io/)
 [![IBM Cloud](https://img.shields.io/badge/IBM_Cloud-Code_Engine-blueviolet)](https://www.ibm.com/cloud/code-engine)
 
----
 
-URL to access portal: https://application-test1.1yoossgcut95.ca-tor.codeengine.appdomain.cloud/
-
----
 
 ### Table of Contents
 
@@ -122,9 +118,17 @@ Our solution is built on a collection of modular, independent skills that each p
     Create a file named `.env` in the root of the project directory and add your credentials:
     ```
     WATSONx_URL=https://us-south.ml.cloud.ibm.com
-    WO_API_KEY="your_ibm_cloud_api_key"
+    WATSONX_API_KEY="your_ibm_cloud_api_key"
     WATSONx_PROJECT_ID="your_watsonx_project_id"
     ```
+    
+    **Optional configuration:**
+    ```
+    VLM_MODEL_ID="meta-llama/llama-3-2-90b-vision-instruct"  # Default VLM model for document classification
+    LLM_MODEL_ID="meta-llama/llama-3-3-70b-instruct"         # Default LLM model for expert reasoning
+    ```
+    
+    **Note:** The legacy environment variable name `WO_API_KEY` is still supported for backward compatibility but is deprecated. Please use `WATSONX_API_KEY` for new deployments.
 
 **Running the Application:**
 1.  Open your terminal in the project root.
@@ -174,18 +178,5 @@ Implementing the DocGuard framework provides transformative benefits:
 *   **Strengthened Governance**: Creates a fully auditable, automated record of every verification check, dramatically improving compliance and internal controls.
 *   **Scalable and Adaptable**: The skill-based architecture allows new detection methods to be easily plugged into the workflow as AI fraud techniques evolve, ensuring the solution remains effective over the long term.
 
-### 10. Team Information
 
-*   **Team Name:** Transformation champs
-*   **Team Number:** 104
-*   **Team Members:**
-    *   Maria Miccolis
-    *   INDIRAKUMAR S
-    *   Vishal Sundareshwaran
-    *   AMIT SINGH
-    *   Hari Prashanth.K
-    *   Kavitha A
-    *   Lakshmi Manchala
-    *   Sayeed Ahmad
-    *   Vijayakumar Sampath
-    *   VINEET MEHROTRA
+

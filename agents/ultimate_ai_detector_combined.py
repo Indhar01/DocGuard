@@ -32,6 +32,7 @@ from PIL.ExifTags import TAGS
 import warnings
 from dotenv import load_dotenv
 import base64
+import time
 from ibm_watsonx_ai.foundation_models import ModelInference
 from ibm_watsonx_ai.credentials import Credentials
 from scipy import ndimage, fftpack
@@ -45,8 +46,60 @@ warnings.filterwarnings('ignore')
 
 # Configuration
 WATSONX_URL = os.getenv("WATSONx_URL")
-WATSONX_API_KEY = os.getenv("WO_API_KEY") 
+# Support both new standard naming and legacy abbreviated form for backward compatibility
+WATSONX_API_KEY = os.getenv("WATSONX_API_KEY") or os.getenv("WO_API_KEY")
+if os.getenv("WO_API_KEY") and not os.getenv("WATSONX_API_KEY"):
+    print("⚠️ Warning: 'WO_API_KEY' is deprecated. Please use 'WATSONX_API_KEY' instead.")
 WATSONX_PROJECT_ID = os.getenv("WATSONx_PROJECT_ID")
+
+# Model IDs - configurable via environment variables
+VLM_MODEL_ID = os.getenv("VLM_MODEL_ID", "meta-llama/llama-3-2-90b-vision-instruct")
+LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "meta-llama/llama-3-3-70b-instruct")
+
+# Model parameters - configurable via environment variables
+MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "0.0"))
+MODEL_TOP_P = float(os.getenv("MODEL_TOP_P", "1.0"))
+MODEL_SEED = int(os.getenv("MODEL_SEED", "42"))
+
+# Retry configuration for API calls
+MAX_API_RETRIES = 3
+RETRY_BACKOFF_FACTOR = 2.0  # Exponential backoff multiplier
+RETRY_INITIAL_DELAY = 1.0  # Initial delay in seconds
+
+def retry_api_call(func, max_retries=MAX_API_RETRIES, backoff_factor=RETRY_BACKOFF_FACTOR, initial_delay=RETRY_INITIAL_DELAY):
+    """
+    Retry an API call with exponential backoff
+    
+    Args:
+        func: Function to retry (should return a result or raise an exception)
+        max_retries: Maximum number of retry attempts
+        backoff_factor: Multiplier for exponential backoff
+        initial_delay: Initial delay between retries in seconds
+    
+    Returns:
+        Result from successful function call
+        
+    Raises:
+        Exception: If all retries are exhausted
+    """
+    last_exception = None
+    delay = initial_delay
+    
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries - 1:  # Don't sleep after last attempt
+                print(f"  ⚠️ API call failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                print(f"     Retrying in {delay:.1f} seconds...")
+                time.sleep(delay)
+                delay *= backoff_factor
+            else:
+                print(f"  ❌ API call failed after {max_retries} attempts: {str(e)}")
+    
+    # If we get here, all retries failed
+    raise last_exception
 
 # ===================================================================
 # ============ LAYER 1: DOCUMENT DEEPFAKE DETECTION ===============
@@ -781,6 +834,65 @@ class UltimateAIContentDetector:
                 print("⚠️ Warning: Watsonx env variables not set. GenAI features disabled.")
         except Exception as e:
             print(f"❌ Error configuring Watsonx.ai: {e}. GenAI features disabled.")
+    
+    def test_watsonx_connection(self):
+        """
+        Test Watsonx.ai connection and configuration
+        
+        Returns:
+            dict: Status information including connectivity, model availability, and any errors
+        """
+        status = {
+            'configured': False,
+            'credentials_valid': False,
+            'llm_accessible': False,
+            'vlm_accessible': False,
+            'errors': [],
+            'warnings': []
+        }
+        
+        # Check if configured
+        if not self.genai_enabled:
+            status['errors'].append("Watsonx.ai is not configured. Check environment variables.")
+            return status
+        
+        status['configured'] = True
+        
+        # Test credentials
+        try:
+            # Try to create a simple model instance to verify credentials
+            test_model = ModelInference(
+                model_id=LLM_MODEL_ID,
+                credentials=self.credentials,
+                project_id=self.project_id,
+                params={"temperature": 0.0}
+            )
+            status['credentials_valid'] = True
+            status['llm_accessible'] = True
+        except Exception as e:
+            status['errors'].append(f"LLM connection failed: {str(e)}")
+        
+        # Test VLM model
+        try:
+            test_vlm = ModelInference(
+                model_id=VLM_MODEL_ID,
+                credentials=self.credentials,
+                project_id=self.project_id,
+                params={"temperature": 0.0}
+            )
+            status['vlm_accessible'] = True
+        except Exception as e:
+            status['errors'].append(f"VLM connection failed: {str(e)}")
+        
+        # Add configuration info
+        status['config'] = {
+            'url': WATSONX_URL,
+            'project_id': self.project_id[:8] + '...' if self.project_id else None,
+            'llm_model': LLM_MODEL_ID,
+            'vlm_model': VLM_MODEL_ID
+        }
+        
+        return status
 
     # ===================================================================
     # =========== LAYER 0: VLM-BASED DOCUMENT CLASSIFICATION ===========
@@ -792,12 +904,12 @@ class UltimateAIContentDetector:
             return {'error': "Watsonx.ai is not configured."}
         
         try:
-            print("  🔍 Performing VLM analysis (Classification, OCR, Visual)...")
+            print(f"  🔍 Performing VLM analysis (Classification, OCR, Visual) using {VLM_MODEL_ID}...")
             model = ModelInference(
-                model_id="meta-llama/llama-3-2-90b-vision-instruct", 
-                credentials=self.credentials, 
+                model_id=VLM_MODEL_ID,
+                credentials=self.credentials,
                 project_id=self.project_id,
-                params={"temperature": 0.0, "top_p": 1.0, "seed": 42}
+                params={"temperature": MODEL_TEMPERATURE, "top_p": MODEL_TOP_P, "seed": MODEL_SEED}
             )
             
             with open(image_path, "rb") as img_file: 
@@ -842,12 +954,12 @@ class UltimateAIContentDetector:
             return {'error': "Watsonx.ai is not configured."}
         
         try:
-            print("  🧠 Performing LLM reasoning on combined data...")
+            print(f"  🧠 Performing LLM reasoning on combined data using {LLM_MODEL_ID}...")
             model = ModelInference(
-                model_id="meta-llama/llama-3-3-70b-instruct", 
-                credentials=self.credentials, 
+                model_id=LLM_MODEL_ID,
+                credentials=self.credentials,
                 project_id=self.project_id,
-                params={"temperature": 0.0, "top_p": 1.0, "seed": 42}
+                params={"temperature": MODEL_TEMPERATURE, "top_p": MODEL_TOP_P, "seed": MODEL_SEED}
             )
             
             summary_for_llm = json.dumps(combined_results, indent=2, default=str)
@@ -877,8 +989,12 @@ class UltimateAIContentDetector:
             Return ONLY valid JSON, no other text.
             """
             
-            response = model.generate(prompt=prompt)
-            return self._safe_json_parse(response['results'][0]['generated_text'])
+            # Wrap API call in retry logic
+            def make_llm_call():
+                response = model.generate(prompt=prompt)
+                return self._safe_json_parse(response['results'][0]['generated_text'])
+            
+            return retry_api_call(make_llm_call)
             
         except Exception as e:
             return {'error': f"Failed LLM reasoning: {e}"}
@@ -934,8 +1050,31 @@ class UltimateAIContentDetector:
         vlm_result = self.classify_and_analyze_with_vlm(image_path)
         results['layer_0_vlm_analysis'] = vlm_result
         
-        doc_type = vlm_result.get('document_type', 'unknown')
-        ocr_text = vlm_result.get('ocr_text', "")
+        # Validate VLM result
+        if 'error' in vlm_result:
+            print(f"  ❌ VLM Analysis failed: {vlm_result['error']}")
+            doc_type = 'unknown'
+            ocr_text = ""
+        else:
+            # Validate required fields
+            doc_type = vlm_result.get('document_type', 'unknown')
+            if not isinstance(doc_type, str):
+                print(f"  ⚠️ WARNING: Invalid document_type format, defaulting to 'unknown'")
+                doc_type = 'unknown'
+            
+            ocr_text = vlm_result.get('ocr_text', "")
+            if not isinstance(ocr_text, str):
+                print(f"  ⚠️ WARNING: Invalid ocr_text format, defaulting to empty string")
+                ocr_text = ""
+            
+            # Validate visual_ai_score is a number
+            visual_score = vlm_result.get('visual_ai_score', 0.5)
+            if not isinstance(visual_score, (int, float)):
+                print(f"  ⚠️ WARNING: Invalid visual_ai_score format, defaulting to 0.5")
+                vlm_result['visual_ai_score'] = 0.5
+            elif not (0 <= visual_score <= 1):
+                print(f"  ⚠️ WARNING: visual_ai_score {visual_score} outside valid range [0,1], clamping")
+                vlm_result['visual_ai_score'] = max(0, min(1, visual_score))
         
         print(f"  📋 VLM Classified Document as: '{doc_type}'")
         
@@ -959,8 +1098,15 @@ class UltimateAIContentDetector:
             specialist = self.specialists[doc_type]
             results['layer_3_specialized_logic'] = specialist.analyze(ocr_text)
         else:
-            print("  ⚠️ No specialist analyzer for this document type.")
-            results['layer_3_specialized_logic'] = {"info": "Unknown document type, no specific logic applied."}
+            # Warn about missing specialist - could indicate VLM misclassification
+            available_types = ', '.join(self.specialists.keys())
+            print(f"  ⚠️ WARNING: No specialist analyzer for document type '{doc_type}'.")
+            print(f"      Available specialist types: {available_types}")
+            results['layer_3_specialized_logic'] = {
+                "info": f"Unknown document type '{doc_type}', no specific logic applied.",
+                "warning": f"Document classified as '{doc_type}' but no specialist analyzer exists.",
+                "available_specialists": list(self.specialists.keys())
+            }
         
         # Layer 4: Traditional Forensic Analysis
         print("  📊 Running traditional forensic analysis...")
@@ -972,6 +1118,10 @@ class UltimateAIContentDetector:
         # Layer 5: LLM Expert Reasoning
         if self.genai_enabled:
             llm_result = self.analyze_with_llm_reasoning(results)
+            # Validate LLM result
+            if 'error' in llm_result:
+                print(f"  ⚠️ LLM reasoning failed: {llm_result['error']}")
+                print(f"      Continuing with reduced analysis capabilities.")
             results['layer_5_llm_reasoning'] = llm_result
         else:
             results['layer_5_llm_reasoning'] = {'info': 'GenAI features disabled'}
@@ -1110,15 +1260,24 @@ class UltimateAIContentDetector:
         
         # Layer 0: VLM Visual Analysis
         vlm_result = results.get('layer_0_vlm_analysis', {})
-        if 'visual_ai_score' in vlm_result:
-            probabilities.append(vlm_result['visual_ai_score'])
-            weights.append(0.15)  # 15% weight
+        # Only use VLM result if it doesn't contain an error
+        if 'error' not in vlm_result and 'visual_ai_score' in vlm_result:
+            vlm_score = vlm_result['visual_ai_score']
+            if isinstance(vlm_score, (int, float)) and 0 <= vlm_score <= 1:
+                probabilities.append(vlm_score)
+                weights.append(0.15)  # 15% weight
         
         # Layer 5: LLM Expert Reasoning
         llm_result = results.get('layer_5_llm_reasoning', {})
-        if 'final_ai_probability' in llm_result:
-            probabilities.append(llm_result['final_ai_probability'])
-            weights.append(0.15)  # 15% weight
+        # Only use LLM result if it doesn't contain an error
+        if 'error' not in llm_result and 'final_ai_probability' in llm_result:
+            # Validate probability is a number in valid range
+            llm_prob = llm_result['final_ai_probability']
+            if isinstance(llm_prob, (int, float)) and 0 <= llm_prob <= 1:
+                probabilities.append(llm_prob)
+                weights.append(0.15)  # 15% weight
+            else:
+                print(f"⚠️ Warning: Invalid LLM probability {llm_prob}, skipping layer 5")
         
         # Layer 4: Traditional Forensics (Lower Priority)
         traditional = results.get('layer_4_traditional_forensics', {})
@@ -1340,10 +1499,8 @@ def main():
     
     # Test image paths (update as needed)
     test_images = [
-        # "AI-Generated-Reciept-1.jpg",
-        # "M-receipt.png", 
-        # "medical-certificate-template-9.jpeg",
-        "receipt_with_ELA_CFMD_tamper.jpeg"
+        # Add your test image paths here
+        # Example: "test_images/sample_receipt.jpg"
     ]
     
     for image_path in test_images:

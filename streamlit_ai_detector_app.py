@@ -12,6 +12,7 @@ import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import base64
+import imghdr
 
 # Attempt to import fitz (PyMuPDF) and set a flag
 try:
@@ -35,6 +36,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Configuration constants
+MAX_RESULTS_IN_MEMORY = 100  # Maximum number of analysis results to keep in session state
+API_CALL_DELAY = 0.5  # Delay in seconds between API calls to avoid rate limiting
+MAX_PDF_PAGES = 10  # Maximum number of pages to process per PDF document
+MAX_FILE_SIZE_MB = 50  # Maximum file size in megabytes
 
 # Custom CSS for better styling
 st.markdown("""
@@ -119,6 +126,20 @@ if 'detector' not in st.session_state and DETECTOR_AVAILABLE:
     with st.spinner("🚀 Initializing Ultimate AI Detector..."):
         st.session_state.detector = UltimateAIContentDetector()
 
+def add_results_to_session(new_results):
+    """Add new results to session state with automatic cleanup of old results"""
+    if not new_results:
+        return
+    
+    # Add new results to existing results
+    st.session_state.analysis_results.extend(new_results)
+    
+    # If we exceed the limit, keep only the most recent results
+    if len(st.session_state.analysis_results) > MAX_RESULTS_IN_MEMORY:
+        # Keep only the most recent MAX_RESULTS_IN_MEMORY results
+        st.session_state.analysis_results = st.session_state.analysis_results[-MAX_RESULTS_IN_MEMORY:]
+        st.warning(f"⚠️ Result history trimmed to most recent {MAX_RESULTS_IN_MEMORY} files to conserve memory.")
+
 def get_threat_color(threat_level):
     """Get color based on threat level"""
     if "SEVERE" in threat_level:
@@ -145,6 +166,42 @@ def get_threat_class(threat_level):
     else:
         return "threat-low"
 
+def validate_file_type(file_content, expected_extension):
+    """
+    Validate file type using magic numbers (file signatures)
+    
+    Args:
+        file_content: bytes content of the file
+        expected_extension: expected file extension (e.g., '.jpg', '.pdf')
+    
+    Returns:
+        tuple: (is_valid, actual_type)
+    """
+    # Check PDF signature
+    if file_content.startswith(b'%PDF'):
+        return (expected_extension.lower() == '.pdf', 'pdf')
+    
+    # Check image type using imghdr for images
+    # Create a temporary file for imghdr to read
+    import io
+    img_type = imghdr.what(None, h=file_content)
+    
+    if img_type:
+        # Map imghdr types to extensions
+        type_map = {
+            'jpeg': ['.jpg', '.jpeg'],
+            'png': ['.png'],
+            'gif': ['.gif'],
+            'tiff': ['.tiff', '.tif'],
+            'bmp': ['.bmp']
+        }
+        
+        expected_lower = expected_extension.lower()
+        if img_type in type_map:
+            return (expected_lower in type_map[img_type], img_type)
+    
+    return (False, 'unknown')
+
 def analyze_single_file(file_path):
     """Analyze a single file"""
     try:
@@ -167,10 +224,30 @@ def process_uploaded_files(uploaded_files):
     """Process multiple uploaded files, including PDF conversion using PyMuPDF"""
     results = []
     tasks_to_run = []
+    temp_files_to_cleanup = []
     
     # Prepare all files for analysis
     for uploaded_file in uploaded_files:
         file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+        
+        # Check file size
+        file_size_mb = uploaded_file.size / (1024 * 1024)
+        if file_size_mb > MAX_FILE_SIZE_MB:
+            error_msg = f"File '{uploaded_file.name}' is too large ({file_size_mb:.1f} MB). Maximum allowed size is {MAX_FILE_SIZE_MB} MB."
+            st.error(error_msg)
+            results.append({'error': error_msg, 'filename': uploaded_file.name})
+            continue
+        
+        # Validate file type using magic numbers
+        file_content = uploaded_file.read()
+        uploaded_file.seek(0)  # Reset file pointer for later reading
+        
+        is_valid, actual_type = validate_file_type(file_content, file_extension)
+        if not is_valid:
+            error_msg = f"File '{uploaded_file.name}' has invalid file type. Extension says '{file_extension}' but actual type is '{actual_type}'. Possible file corruption or extension spoofing."
+            st.error(error_msg)
+            results.append({'error': error_msg, 'filename': uploaded_file.name})
+            continue
 
         if file_extension == ".pdf":
             if not PDF_SUPPORT_ENABLED:
@@ -181,13 +258,21 @@ def process_uploaded_files(uploaded_files):
                 # Convert PDF pages to images using PyMuPDF
                 doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
                 base_name = os.path.splitext(uploaded_file.name)[0]
+                total_pages = len(doc)
                 
-                for page_num, page in enumerate(doc):
+                # Limit number of pages processed
+                pages_to_process = min(total_pages, MAX_PDF_PAGES)
+                if total_pages > MAX_PDF_PAGES:
+                    st.warning(f"⚠️ PDF '{uploaded_file.name}' has {total_pages} pages. Processing only the first {MAX_PDF_PAGES} pages to conserve resources.")
+                
+                for page_num in range(pages_to_process):
+                    page = doc[page_num]
                     pix = page.get_pixmap()
                     page_name = f"{base_name}_page_{page_num+1}.png"
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
                         tmp_file.write(pix.tobytes("png"))  # write raw PNG bytes
                         tasks_to_run.append({'path': tmp_file.name, 'name': page_name})
+                        temp_files_to_cleanup.append(tmp_file.name)
 
                 
                 doc.close()
@@ -199,26 +284,42 @@ def process_uploaded_files(uploaded_files):
             with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
                 tmp_file.write(uploaded_file.getbuffer())
                 tasks_to_run.append({'path': tmp_file.name, 'name': uploaded_file.name})
+                temp_files_to_cleanup.append(tmp_file.name)
 
-    # Run analysis on the prepared image files
-    if tasks_to_run:
-        overall_progress = st.progress(0)
-        status_text = st.empty()
-        
-        for i, task in enumerate(tasks_to_run):
-            progress = (i) / len(tasks_to_run)
-            overall_progress.progress(progress)
-            status_text.text(f"🔍 Analyzing: {task['name']} ({i+1}/{len(tasks_to_run)})")
+    # Run analysis on the prepared image files with guaranteed cleanup
+    try:
+        if tasks_to_run:
+            overall_progress = st.progress(0)
+            status_text = st.empty()
             
+            for i, task in enumerate(tasks_to_run):
+                progress = (i) / len(tasks_to_run)
+                overall_progress.progress(progress)
+                status_text.text(f"🔍 Analyzing: {task['name']} ({i+1}/{len(tasks_to_run)})")
+                
+                try:
+                    result = analyze_single_file(task['path'])
+                    result['filename'] = task['name'] # Ensure correct filename is used in report
+                    results.append(result)
+                except Exception as e:
+                    # Add error result if analysis fails
+                    results.append({'error': str(e), 'filename': task['name']})
+                
+                # Add delay between API calls to avoid rate limiting (except for last file)
+                if i < len(tasks_to_run) - 1:
+                    time.sleep(API_CALL_DELAY)
+            
+            overall_progress.progress(1.0)
+            status_text.text("✅ Analysis complete!")
+    finally:
+        # Guaranteed cleanup of all temp files, even if exception occurs
+        for temp_file in temp_files_to_cleanup:
             try:
-                result = analyze_single_file(task['path'])
-                result['filename'] = task['name'] # Ensure correct filename is used in report
-                results.append(result)
-            finally:
-                os.unlink(task['path']) # Clean up temp file
-        
-        overall_progress.progress(1.0)
-        status_text.text("✅ Analysis complete!")
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except Exception as e:
+                # Log but don't fail on cleanup errors
+                print(f"Warning: Failed to cleanup temp file {temp_file}: {e}")
     
     return results
 
@@ -586,6 +687,51 @@ def main():
             genai_status = "🟢 Active" if st.session_state.detector.genai_enabled else "🟡 Disabled"
             st.info(f"GenAI Features: {genai_status}")
             
+            # Health check button
+            if st.button("🏥 Run Health Check"):
+                with st.spinner("Testing Watsonx connection..."):
+                    health_status = st.session_state.detector.test_watsonx_connection()
+                    
+                    if health_status['configured']:
+                        if health_status['credentials_valid']:
+                            st.success("✅ Watsonx connection successful!")
+                            
+                            # Show detailed status
+                            status_details = []
+                            if health_status['llm_accessible']:
+                                status_details.append("✅ LLM accessible")
+                            else:
+                                status_details.append("❌ LLM not accessible")
+                            
+                            if health_status['vlm_accessible']:
+                                status_details.append("✅ VLM accessible")
+                            else:
+                                status_details.append("❌ VLM not accessible")
+                            
+                            st.info("\n".join(status_details))
+                            
+                            if health_status['config']:
+                                config = health_status['config']
+                                st.code(f"""Configuration:
+URL: {config['url']}
+Project ID: {config['project_id']}
+LLM Model: {config['llm_model']}
+VLM Model: {config['vlm_model']}""")
+                        else:
+                            st.error("❌ Connection failed!")
+                    else:
+                        st.error("❌ Watsonx not configured!")
+                    
+                    # Show errors if any
+                    if health_status['errors']:
+                        for error in health_status['errors']:
+                            st.error(f"Error: {error}")
+                    
+                    # Show warnings if any
+                    if health_status['warnings']:
+                        for warning in health_status['warnings']:
+                            st.warning(f"Warning: {warning}")
+            
             st.info("🔍 Detection Layers:\n" +
                    "• VLM Document Classification\n" +
                    "• Deepfake Detection\n" +
@@ -629,7 +775,8 @@ def main():
                 if st.button("🚀 Analyze All Files", type="primary", use_container_width=True):
                     with st.spinner("🔍 Processing files... This may take a moment."):
                         results = process_uploaded_files(uploaded_files)
-                        st.session_state.analysis_results = results
+                        # Use helper function to add results with automatic memory management
+                        add_results_to_session(results)
                         st.success("✅ Analysis complete!")
                         # Use st.rerun() to immediately switch to the results tab after analysis
                         st.rerun()
